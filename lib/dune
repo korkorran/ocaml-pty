@@ -1,0 +1,4 @@
+(library
+ (name ocaml_pty)
+ (foreign_stubs (language c) (names pty-stubs))
+ (libraries unix))
