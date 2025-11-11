@@ -1,75 +1,93 @@
+(* opty_simple.ml *)
 external posix_openpt : unit -> Unix.file_descr = "ocaml_posix_openpt"
 external grantpt : Unix.file_descr -> unit = "ocaml_grantpt"
 external unlockpt : Unix.file_descr -> unit = "ocaml_unlockpt"
 external ptsname : Unix.file_descr -> string = "ocaml_ptsname"
-(* external tcsetpgrp : Unix.file_descr -> int -> unit = "ocaml_tcsetpgrp" *)
 external isatty : Unix.file_descr -> bool = "ocaml_isatty"
 external set_controlling_tty : Unix.file_descr -> unit = "ocaml_set_controlling_tty"
 external disable_echo : Unix.file_descr -> unit = "ocaml_disable_echo"
 
-let () =
-  (* Capture SIGINT pour nettoyer les ressources *)
-  Sys.set_signal Sys.sigint (Sys.Signal_handle (fun _ ->
-    print_endline "\nFermeture du pseudo-terminal...";
-    exit 0
-  ));
+let contains s1 s2 =
+    let re = Str.regexp_string s2
+    in
+        try ignore (Str.search_forward re s1 0); true
+        with Not_found -> false
 
-  (* Ouvre le PTY maître *)
+
+let () =
   let master = posix_openpt () in
   grantpt master;
   unlockpt master;
   let slave_name = ptsname master in
-
   match Unix.fork () with
   | 0 -> (* Processus enfant : esclave *)
       let slave_fd = Unix.openfile slave_name [Unix.O_RDWR] 0o600 in
-      (* Vérifie que slave_fd est un terminal *)
-    if not (isatty slave_fd) then (
-      prerr_endline "Erreur : slave_fd n'est pas un terminal";
-      exit 1
-    );
-    (* Désactive l'écho sur le PTY esclave *)
-    disable_echo slave_fd;
-    (* Crée une nouvelle session et dissocie le processus du terminal parent *)
-    ignore (Unix.setsid ());
-    (* Associe le PTY esclave comme terminal contrôlant *)
-    (try set_controlling_tty slave_fd
-     with Failure msg ->
-       prerr_endline ("Erreur : " ^ msg);
-       exit 1);
-      (* Redirige stdin, stdout, stderr vers le PTY esclave *)
+      if not (isatty slave_fd) then (
+        prerr_endline "Erreur : slave_fd n'est pas un terminal";
+        exit 1
+      );
+      disable_echo slave_fd;
+      ignore (Unix.setsid ());
+      (try set_controlling_tty slave_fd
+       with Failure msg ->
+         prerr_endline ("Erreur : " ^ msg);
+         exit 1);
       Unix.dup2 slave_fd Unix.stdin;
       Unix.dup2 slave_fd Unix.stdout;
       Unix.dup2 slave_fd Unix.stderr;
       Unix.close slave_fd;
       Unix.close master;
-      (* Lance un shell *)
-      Unix.execvp "/bin/sh" [|"/bin/sh"; "--noediting"|]
-      (* Si execvp échoue : 
-      prerr_endline "Erreur : impossible de lancer /bin/sh";
-      exit 1 *)
 
+      (* Liste des commandes à exécuter *)
+      let commands = ["ls -l"; "git log --oneline -5"; "pwd"] in
+      let execute_command cmd =
+        let ic, oc = Unix.open_process cmd in
+        let buf = Bytes.create 1024 in
+        let rec read_output () =
+          let n = input ic buf 0 (Bytes.length buf) in
+          if n > 0 then (
+            ignore (Unix.write Unix.stdout buf 0 n);
+            read_output ()
+          )
+        in
+        read_output ();
+        ignore (Unix.close_process (ic, oc))
+      in
+      List.iter execute_command commands;
+      (* Envoie un message de fin *)
+      let end_msg = "__END_OF_OUTPUT__\n" in
+      ignore (Unix.write Unix.stdout (Bytes.of_string end_msg) 0 (String.length end_msg));
+      exit 0
   | pid -> (* Processus parent : maître *)
       ignore pid;
       let buf = Bytes.create 1024 in
+      let output = Buffer.create 1024 in
+      let end_msg = "__END_OF_OUTPUT__" in
       let rec loop () =
-        (* Utilise select pour surveiller stdin et master *)
-        let ready_fds, _, _ = Unix.select [Unix.stdin; master] [] [] (-1.) in
-        List.iter (fun fd ->
-          if fd == Unix.stdin then (
-            (* Lit depuis stdin et écrit vers master *)
-            let n = Unix.read Unix.stdin buf 0 (Bytes.length buf) in
-            if n > 0 then ignore (Unix.write master buf 0 n)
-          ) else if fd == master then (
-            (* Lit depuis master et écrit vers stdout *)
-            let m = Unix.read master buf 0 (Bytes.length buf) in
-            if m > 0 then ignore (Unix.write Unix.stdout buf 0 m)
+        let ready_fds, _, _ = Unix.select [master] [] [] 1.0 in
+        if List.exists (fun fd -> fd == master) ready_fds then (
+          let m = Unix.read master buf 0 (Bytes.length buf) in
+          if m > 0 then (
+            let str = Bytes.sub_string buf 0 m in
+            Buffer.add_string output str;
+            (* ignore (Unix.write Unix.stdout buf 0 m);
+             Vérifie si le message de fin est présent *)
+            if contains str end_msg then (
+              Unix.close master;
+              let result = Buffer.contents output in
+              Printf.printf "\nRésultat final :\n%s\n" result;
+            ) else (
+              loop ()
+            )
+          ) else (
+            loop ()
           )
-        ) ready_fds;
-        loop ()
+        ) else (
+          loop ()
+        )
       in
-      (* Capture les exceptions pour fermer proprement master *)
-      try loop ()
+      try
+        loop ();
       with e ->
         Unix.close master;
         prerr_endline ("Erreur dans la boucle : " ^ Printexc.to_string e);
