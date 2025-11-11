@@ -1,4 +1,6 @@
 (executable
  (public_name ocaml-pty)
  (name main)
- (libraries ocaml_pty))
+ (modules pty main)
+ (foreign_stubs (language c) (names pty-stubs))
+ (libraries ocaml_pty lwt lwt.unix cstruct-lwt))

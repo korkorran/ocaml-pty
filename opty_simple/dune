@@ -1,0 +1,4 @@
+(executable
+ (foreign_stubs (language c) (names pty-stubs))
+ (name opty_simple)
+ (libraries unix))
